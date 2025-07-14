@@ -10,13 +10,15 @@ import subprocess
 import uuid
 import logging
 import pathlib
+import tempfile
 from datetime import datetime
 
 # --- Paths ---
-BASE_DIR     = pathlib.Path(__file__).parent.resolve()
-COOKIES_FILE = BASE_DIR / "yt.txt"
-# HuggingFace Space: pisanje je dozvoljeno samo pod /mnt/data
-HLS_ROOT     = pathlib.Path("/mnt/data/hls_segments")
+BASE_DIR      = pathlib.Path(__file__).parent.resolve()
+COOKIES_FILE  = BASE_DIR / "yt.txt"
+# Sad ide ispod /tmp, gde Space dozvoljava pisanje
+HLS_ROOT_BASE = pathlib.Path(tempfile.gettempdir())
+HLS_ROOT      = HLS_ROOT_BASE / "hls_segments"
 
 # --- Ensure dirs exist ---
 os.makedirs(HLS_ROOT, exist_ok=True)
@@ -77,14 +79,13 @@ async def stream_video(request: Request, url: str = Query(...), resolution: int 
             key=lambda x: x.get('abr', 0)
         )
 
-        # 4) Prepare HLS session dir under /mnt/data
+        # 4) Prepare HLS session dir under /tmp
         session_id = uuid.uuid4().hex
         sess_dir = HLS_ROOT / session_id
         os.makedirs(sess_dir, exist_ok=True)
 
         # 5) Build ffmpeg command with UA + Cookie headers
         cookie_header = load_cookies_header()
-        # ubacujemo i User-Agent
         hdr = ['-headers', f"User-Agent: Mozilla/5.0\r\nCookie: {cookie_header}\r\n"]
         cmd = [
             'ffmpeg', '-hide_banner', '-loglevel', 'error',
@@ -100,7 +101,7 @@ async def stream_video(request: Request, url: str = Query(...), resolution: int 
         ]
         proc = subprocess.Popen(cmd, cwd=str(sess_dir))
 
-        # 6) Sačekamo pojavu playlist-e (do 10s)
+        # 6) Wait for playlist (up to 10s)
         playlist_path = sess_dir / 'index.m3u8'
         for _ in range(20):
             if playlist_path.exists():
@@ -110,7 +111,7 @@ async def stream_video(request: Request, url: str = Query(...), resolution: int 
             proc.kill()
             raise HTTPException(status_code=500, detail="HLS playlist generation failed")
 
-        # 7) Redirect korisnika na X-m3u8 URL
+        # 7) Redirect to the generated playlist
         playlist_url = request.url_for('hls', path=f"{session_id}/index.m3u8")
         return RedirectResponse(playlist_url)
 
