@@ -1,4 +1,3 @@
-# main.py
 from fastapi import FastAPI, Request, Query, HTTPException
 from fastapi.responses import RedirectResponse, JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
@@ -13,14 +12,18 @@ import logging
 import pathlib
 from datetime import datetime
 
-# --- Paths (use /cache on HF Spaces) ---
-BASE_DIR     = pathlib.Path(__file__).parent.resolve()
-CACHE_DIR    = pathlib.Path(os.getenv("CACHE_DIR", "/cache"))
-COOKIES_FILE = BASE_DIR / "yt.txt"
-HLS_ROOT     = CACHE_DIR / "hls_segments"
+# --- Paths ---
+CODE_DIR     = pathlib.Path(__file__).parent.resolve()
+COOKIES_FILE = CODE_DIR / "yt.txt"
 
-# --- Ensure writeable dirs exist ---
-for d in (HLS_ROOT,):
+# Use HF writable cache area
+CACHE_DIR        = pathlib.Path("/mnt/data")
+HLS_ROOT         = CACHE_DIR / "hls_segments"
+OUTPUT_DIR       = CACHE_DIR / "output"
+SPOTIFY_OUTPUT_DIR = CACHE_DIR / "spotify_output"
+
+# --- Ensure dirs exist ---
+for d in (HLS_ROOT, OUTPUT_DIR, SPOTIFY_OUTPUT_DIR):
     os.makedirs(d, exist_ok=True)
 
 # --- Concurrency & Logging ---
@@ -31,7 +34,6 @@ logger = logging.getLogger(__name__)
 # --- FastAPI setup ---
 app = FastAPI(title="YouTube Downloader with HLS", version="2.0.3")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
-# mount HLS directory under /hls
 app.mount("/hls", StaticFiles(directory=str(HLS_ROOT)), name="hls")
 
 def load_cookies_header() -> str:
@@ -65,23 +67,23 @@ async def stream_video(request: Request, url: str = Query(...), resolution: int 
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             info = ydl.extract_info(url, download=False)
 
-        # 2) Pick exactly resolution video-only
+        # 2) Pick exact 1080p mp4 video-only
         vid_fmt = next(
             f for f in info['formats']
             if f.get('vcodec') != 'none' and f.get('height') == resolution and f.get('ext') == 'mp4'
         )
-        # 3) Best audio-only
+        # 3) Pick best audio-only
         aud_fmt = max(
             (f for f in info['formats'] if f.get('vcodec') == 'none' and f.get('acodec') != 'none'),
             key=lambda x: x.get('abr', 0)
         )
 
-        # 4) Prepare per-session HLS folder
+        # 4) Prepare HLS session
         session_id = uuid.uuid4().hex
         sess_dir = HLS_ROOT / session_id
         os.makedirs(sess_dir, exist_ok=True)
 
-        # 5) Launch ffmpeg to generate HLS (.m3u8 + .ts)
+        # 5) Launch ffmpeg to generate .m3u8 + .ts files
         cookie_header = load_cookies_header()
         hdr = ['-headers', f"Cookie: {cookie_header}\r\n"]
         cmd = [
@@ -98,7 +100,7 @@ async def stream_video(request: Request, url: str = Query(...), resolution: int 
         ]
         proc = subprocess.Popen(cmd, cwd=str(sess_dir))
 
-        # 6) Wait up to 10s for playlist
+        # 6) Wait for playlist to appear (up to 10s)
         playlist_path = sess_dir / 'index.m3u8'
         for _ in range(20):
             if playlist_path.exists():
@@ -108,12 +110,12 @@ async def stream_video(request: Request, url: str = Query(...), resolution: int 
             proc.kill()
             raise HTTPException(status_code=500, detail="HLS playlist generation failed")
 
-        # 7) Redirect to generated playlist
+        # 7) Redirect client to the generated playlist
         playlist_url = request.url_for('hls', path=f"{session_id}/index.m3u8")
         return RedirectResponse(playlist_url)
 
     except StopIteration:
-        raise HTTPException(status_code=404, detail=f"No {resolution}p stream available")
+        raise HTTPException(status_code=404, detail=f"No {resolution}p video stream available")
     except Exception as e:
         logger.error("stream_video error", exc_info=True)
         raise HTTPException(status_code=500, detail=str(e))
