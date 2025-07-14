@@ -1,6 +1,5 @@
-import tempfile
 import pathlib
-import shutil
+import tempfile
 import asyncio
 import subprocess
 import uuid
@@ -15,17 +14,12 @@ import yt_dlp
 
 # --- Paths ---
 BASE_DIR     = pathlib.Path(__file__).parent.resolve()
-ORIG_COOKIE  = BASE_DIR / "yt.txt"
-TMP_DIR      = pathlib.Path(tempfile.gettempdir())            # /tmp
-TMP_COOKIE   = TMP_DIR / "yt.txt"
+COOKIES_FILE = BASE_DIR / "yt.txt"                              # originalni cookies, read‐only
+TMP_DIR      = pathlib.Path(tempfile.gettempdir())             # /tmp
 HLS_ROOT     = TMP_DIR / "hls_segments"
 
-# --- Ensure temp dirs/files exist ---
-TMP_DIR.mkdir(exist_ok=True)
+# --- Ensure HLS dir exists under /tmp ---
 HLS_ROOT.mkdir(parents=True, exist_ok=True)
-# Copy original cookies into tmp so yt-dlp can write back
-if ORIG_COOKIE.exists():
-    shutil.copy(ORIG_COOKIE, TMP_COOKIE)
 
 # --- Concurrency & Logging ---
 download_semaphore = asyncio.Semaphore(30)
@@ -38,8 +32,9 @@ app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], all
 app.mount("/hls", StaticFiles(directory=str(HLS_ROOT)), name="hls")
 
 def load_cookies_header() -> str:
+    """Učitava samo‐čitanje cookie fajla i vraća header string."""
     cookies = []
-    with open(TMP_COOKIE, "r") as f:
+    with open(COOKIES_FILE, "r") as f:
         for line in f:
             if line.startswith("#") or not line.strip():
                 continue
@@ -63,33 +58,36 @@ async def root():
 @app.get("/stream/", summary="HLS stream")
 async def stream_video(request: Request, url: str = Query(...), resolution: int = Query(1080)):
     try:
-        # 1) Extract formats with cookiefile pointing to /tmp/yt.txt
+        # 1) Izvuci formate iz yt-dlp, samo‐čitanje cookieja i BEZ upisa nazad
         ydl_opts = {
             "quiet": True,
-            "cookiefile": str(TMP_COOKIE),
+            "cookiefile": str(COOKIES_FILE),
             "no_warnings": True,
+            "no_write_cookies": True,      # <— sprečava PermissionError pri izlazu
         }
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             info = ydl.extract_info(url, download=False)
 
-        # 2) Pick exact 1080p mp4 video-only
+        # 2) Nađi EXPLICITNO 1080p mp4 video‐only tok
         vid_fmt = next(
             f for f in info["formats"]
-            if f.get("vcodec") != "none" and f.get("height") == resolution and f.get("ext") == "mp4"
+            if f.get("vcodec") != "none"
+               and f.get("height") == resolution
+               and f.get("ext") == "mp4"
         )
 
-        # 3) Pick highest‐bitrate audio-only
+        # 3) Nađi najbolji audio‐only tok
         aud_fmt = max(
             (f for f in info["formats"] if f.get("vcodec") == "none" and f.get("acodec") != "none"),
             key=lambda x: x.get("abr", 0)
         )
 
-        # 4) Prepare per-session directory under /tmp/hls_segments
+        # 4) Pripremi session folder u /tmp/hls_segments
         session_id = uuid.uuid4().hex
         sess_dir = HLS_ROOT / session_id
         sess_dir.mkdir(parents=True, exist_ok=True)
 
-        # 5) Launch ffmpeg to generate HLS (.m3u8 + .ts)
+        # 5) Startuj FFmpeg za HLS generisanje
         cookie_header = load_cookies_header()
         hdr = ["-headers", f"Cookie: {cookie_header}\r\n"]
         cmd = [
@@ -106,7 +104,7 @@ async def stream_video(request: Request, url: str = Query(...), resolution: int 
         ]
         proc = subprocess.Popen(cmd, cwd=str(sess_dir))
 
-        # 6) Wait up to ~10s for the playlist to appear
+        # 6) Sačekaj do 10s da playlist fajl bude tu
         playlist = sess_dir / "index.m3u8"
         for _ in range(20):
             if playlist.exists():
@@ -116,7 +114,7 @@ async def stream_video(request: Request, url: str = Query(...), resolution: int 
             proc.kill()
             raise HTTPException(status_code=500, detail="HLS playlist generation failed")
 
-        # 7) Redirect client to the generated HLS playlist
+        # 7) Preusmeri klijenta na playlistu
         playlist_url = request.url_for("hls", path=f"{session_id}/index.m3u8")
         return RedirectResponse(playlist_url)
 
