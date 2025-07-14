@@ -1,25 +1,31 @@
-from fastapi import FastAPI, Request, Query, HTTPException
-from fastapi.responses import RedirectResponse, JSONResponse
-from fastapi.middleware.cors import CORSMiddleware
-from fastapi.staticfiles import StaticFiles
-
-import yt_dlp
-import os
+import tempfile
+import pathlib
+import shutil
 import asyncio
 import subprocess
 import uuid
 import logging
-import pathlib
+
 from datetime import datetime
+from fastapi import FastAPI, Request, Query, HTTPException
+from fastapi.responses import RedirectResponse, JSONResponse
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.staticfiles import StaticFiles
+import yt_dlp
 
 # --- Paths ---
 BASE_DIR     = pathlib.Path(__file__).parent.resolve()
-COOKIES_FILE = BASE_DIR / "yt.txt"
-# Pišemo HLS segmente u /tmp (uvek je pisivo)
-HLS_ROOT     = pathlib.Path("/tmp/hls_segments")
+ORIG_COOKIE  = BASE_DIR / "yt.txt"
+TMP_DIR      = pathlib.Path(tempfile.gettempdir())            # /tmp
+TMP_COOKIE   = TMP_DIR / "yt.txt"
+HLS_ROOT     = TMP_DIR / "hls_segments"
 
-# --- Ensure dirs exist ---
-os.makedirs(HLS_ROOT, exist_ok=True)
+# --- Ensure temp dirs/files exist ---
+TMP_DIR.mkdir(exist_ok=True)
+HLS_ROOT.mkdir(parents=True, exist_ok=True)
+# Copy original cookies into tmp so yt-dlp can write back
+if ORIG_COOKIE.exists():
+    shutil.copy(ORIG_COOKIE, TMP_COOKIE)
 
 # --- Concurrency & Logging ---
 download_semaphore = asyncio.Semaphore(30)
@@ -33,7 +39,7 @@ app.mount("/hls", StaticFiles(directory=str(HLS_ROOT)), name="hls")
 
 def load_cookies_header() -> str:
     cookies = []
-    with open(COOKIES_FILE, "r") as f:
+    with open(TMP_COOKIE, "r") as f:
         for line in f:
             if line.startswith("#") or not line.strip():
                 continue
@@ -57,33 +63,33 @@ async def root():
 @app.get("/stream/", summary="HLS stream")
 async def stream_video(request: Request, url: str = Query(...), resolution: int = Query(1080)):
     try:
-        # 1) Extract formats w/o writing cookies back
+        # 1) Extract formats with cookiefile pointing to /tmp/yt.txt
         ydl_opts = {
             "quiet": True,
-            "cookiefile": str(COOKIES_FILE),
+            "cookiefile": str(TMP_COOKIE),
             "no_warnings": True,
-            "no_write_cookie": True,
         }
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             info = ydl.extract_info(url, download=False)
 
-        # 2) Pick 1080p video-only
+        # 2) Pick exact 1080p mp4 video-only
         vid_fmt = next(
             f for f in info["formats"]
             if f.get("vcodec") != "none" and f.get("height") == resolution and f.get("ext") == "mp4"
         )
-        # 3) Pick best audio-only
+
+        # 3) Pick highest‐bitrate audio-only
         aud_fmt = max(
             (f for f in info["formats"] if f.get("vcodec") == "none" and f.get("acodec") != "none"),
             key=lambda x: x.get("abr", 0)
         )
 
-        # 4) New session directory
+        # 4) Prepare per-session directory under /tmp/hls_segments
         session_id = uuid.uuid4().hex
         sess_dir = HLS_ROOT / session_id
-        os.makedirs(sess_dir, exist_ok=True)
+        sess_dir.mkdir(parents=True, exist_ok=True)
 
-        # 5) Launch ffmpeg to generate HLS
+        # 5) Launch ffmpeg to generate HLS (.m3u8 + .ts)
         cookie_header = load_cookies_header()
         hdr = ["-headers", f"Cookie: {cookie_header}\r\n"]
         cmd = [
@@ -100,17 +106,17 @@ async def stream_video(request: Request, url: str = Query(...), resolution: int 
         ]
         proc = subprocess.Popen(cmd, cwd=str(sess_dir))
 
-        # 6) Wait up to 10s for playlist
-        playlist_path = sess_dir / "index.m3u8"
+        # 6) Wait up to ~10s for the playlist to appear
+        playlist = sess_dir / "index.m3u8"
         for _ in range(20):
-            if playlist_path.exists():
+            if playlist.exists():
                 break
             await asyncio.sleep(0.5)
         else:
             proc.kill()
             raise HTTPException(status_code=500, detail="HLS playlist generation failed")
 
-        # 7) Redirect to HLS playlist
+        # 7) Redirect client to the generated HLS playlist
         playlist_url = request.url_for("hls", path=f"{session_id}/index.m3u8")
         return RedirectResponse(playlist_url)
 
