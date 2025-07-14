@@ -13,10 +13,10 @@ import pathlib
 from datetime import datetime
 
 # --- Paths ---
-BASE_DIR = pathlib.Path(__file__).parent.resolve()
+BASE_DIR     = pathlib.Path(__file__).parent.resolve()
 COOKIES_FILE = BASE_DIR / "yt.txt"
-# HF Spaces ima samo /mnt/data kao pisivu particiju
-HLS_ROOT = pathlib.Path("/mnt/data/hls_segments")
+# HF Spaces pisiva particija
+HLS_ROOT     = pathlib.Path("/mnt/data/hls_segments")
 
 # --- Ensure dirs exist ---
 os.makedirs(HLS_ROOT, exist_ok=True)
@@ -29,7 +29,6 @@ logger = logging.getLogger(__name__)
 # --- FastAPI setup ---
 app = FastAPI(title="YouTube Downloader with HLS", version="2.0.3")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
-# Mount static `/hls` na pisivi dir
 app.mount("/hls", StaticFiles(directory=str(HLS_ROOT)), name="hls")
 
 def load_cookies_header() -> str:
@@ -58,7 +57,7 @@ async def root():
 @app.get("/stream/", summary="HLS stream")
 async def stream_video(request: Request, url: str = Query(...), resolution: int = Query(1080)):
     try:
-        # 1) Preuzmi info, ne upisuj cookies nazad
+        # 1) Extract info without writing cookies back
         ydl_opts = {
             'quiet': True,
             'cookiefile': str(COOKIES_FILE),
@@ -68,23 +67,23 @@ async def stream_video(request: Request, url: str = Query(...), resolution: int 
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             info = ydl.extract_info(url, download=False)
 
-        # 2) Nađi tačan 1080p mp4 video-only tok
+        # 2) Find exact 1080p mp4 video-only
         vid_fmt = next(
             f for f in info['formats']
             if f.get('vcodec') != 'none' and f.get('height') == resolution and f.get('ext') == 'mp4'
         )
-        # 3) Nađi najbolji audio-only tok
+        # 3) Pick best audio-only
         aud_fmt = max(
             (f for f in info['formats'] if f.get('vcodec') == 'none' and f.get('acodec') != 'none'),
             key=lambda x: x.get('abr', 0)
         )
 
-        # 4) Napravi session folder u /mnt/data
+        # 4) Prepare HLS session directory
         session_id = uuid.uuid4().hex
         sess_dir = HLS_ROOT / session_id
         os.makedirs(sess_dir, exist_ok=True)
 
-        # 5) Pokreni ffmpeg za HLS, prosledi cookie header
+        # 5) Spawn ffmpeg to generate HLS segments
         cookie_header = load_cookies_header()
         hdr = ['-headers', f"Cookie: {cookie_header}\r\n"]
         cmd = [
@@ -101,7 +100,7 @@ async def stream_video(request: Request, url: str = Query(...), resolution: int 
         ]
         proc = subprocess.Popen(cmd, cwd=str(sess_dir))
 
-        # 6) Sačekaj da playlist fajl postane dostupan (do 10s)
+        # 6) Wait up to 10s for the playlist
         playlist_path = sess_dir / 'index.m3u8'
         for _ in range(20):
             if playlist_path.exists():
@@ -111,7 +110,7 @@ async def stream_video(request: Request, url: str = Query(...), resolution: int 
             proc.kill()
             raise HTTPException(status_code=500, detail="HLS playlist generation failed")
 
-        # 7) Preusmeri klijenta na HLS manifest
+        # 7) Redirect client to the generated .m3u8
         playlist_url = request.url_for('hls', path=f"{session_id}/index.m3u8")
         return RedirectResponse(playlist_url)
 
