@@ -13,18 +13,12 @@ import pathlib
 from datetime import datetime
 
 # --- Paths ---
-CODE_DIR     = pathlib.Path(__file__).parent.resolve()
-COOKIES_FILE = CODE_DIR / "yt.txt"
-
-# Prebaci sve privremene fajlove u /tmp
-CACHE_DIR           = pathlib.Path("/tmp/plex_yt")
-HLS_ROOT            = CACHE_DIR / "hls_segments"
-OUTPUT_DIR          = CACHE_DIR / "output"
-SPOTIFY_OUTPUT_DIR  = CACHE_DIR / "spotify_output"
+BASE_DIR     = pathlib.Path(__file__).parent.resolve()
+COOKIES_FILE = BASE_DIR / "yt.txt"
+HLS_ROOT     = BASE_DIR / "hls_segments"
 
 # --- Ensure dirs exist ---
-for d in (HLS_ROOT, OUTPUT_DIR, SPOTIFY_OUTPUT_DIR):
-    os.makedirs(d, exist_ok=True)
+os.makedirs(HLS_ROOT, exist_ok=True)
 
 # --- Concurrency & Logging ---
 download_semaphore = asyncio.Semaphore(30)
@@ -62,17 +56,22 @@ async def root():
 @app.get("/stream/", summary="HLS stream")
 async def stream_video(request: Request, url: str = Query(...), resolution: int = Query(1080)):
     try:
-        # 1) Extract formats
-        ydl_opts = {'quiet': True, 'cookiefile': str(COOKIES_FILE), 'no_warnings': True}
+        # 1) Extract all formats, but don't write cookies back
+        ydl_opts = {
+            'quiet': True,
+            'cookiefile': str(COOKIES_FILE),
+            'no_warnings': True,
+            'no_write_cookie': True,       # sprečava upis u yt.txt
+        }
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             info = ydl.extract_info(url, download=False)
 
-        # 2) Pick exact 1080p mp4 video-only
+        # 2) Find exact 1080p mp4 video-only
         vid_fmt = next(
             f for f in info['formats']
             if f.get('vcodec') != 'none' and f.get('height') == resolution and f.get('ext') == 'mp4'
         )
-        # 3) Pick best audio-only
+        # 3) Pick highest-bitrate audio-only
         aud_fmt = max(
             (f for f in info['formats'] if f.get('vcodec') == 'none' and f.get('acodec') != 'none'),
             key=lambda x: x.get('abr', 0)
@@ -83,7 +82,7 @@ async def stream_video(request: Request, url: str = Query(...), resolution: int 
         sess_dir = HLS_ROOT / session_id
         os.makedirs(sess_dir, exist_ok=True)
 
-        # 5) Launch ffmpeg to generate .m3u8 + .ts files
+        # 5) Run ffmpeg to generate .m3u8 + .ts, passing cookies header
         cookie_header = load_cookies_header()
         hdr = ['-headers', f"Cookie: {cookie_header}\r\n"]
         cmd = [
@@ -100,7 +99,7 @@ async def stream_video(request: Request, url: str = Query(...), resolution: int 
         ]
         proc = subprocess.Popen(cmd, cwd=str(sess_dir))
 
-        # 6) Wait for playlist to appear (up to 10s)
+        # 6) Wait up to 10s for playlist to appear
         playlist_path = sess_dir / 'index.m3u8'
         for _ in range(20):
             if playlist_path.exists():
