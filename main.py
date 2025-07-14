@@ -16,11 +16,11 @@ from datetime import datetime
 CODE_DIR     = pathlib.Path(__file__).parent.resolve()
 COOKIES_FILE = CODE_DIR / "yt.txt"
 
-# Use HF writable cache area
-CACHE_DIR        = pathlib.Path("/mnt/data")
-HLS_ROOT         = CACHE_DIR / "hls_segments"
-OUTPUT_DIR       = CACHE_DIR / "output"
-SPOTIFY_OUTPUT_DIR = CACHE_DIR / "spotify_output"
+# Prebaci sve privremene fajlove u /tmp
+CACHE_DIR           = pathlib.Path("/tmp/plex_yt")
+HLS_ROOT            = CACHE_DIR / "hls_segments"
+OUTPUT_DIR          = CACHE_DIR / "output"
+SPOTIFY_OUTPUT_DIR  = CACHE_DIR / "spotify_output"
 
 # --- Ensure dirs exist ---
 for d in (HLS_ROOT, OUTPUT_DIR, SPOTIFY_OUTPUT_DIR):
