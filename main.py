@@ -10,15 +10,12 @@ import subprocess
 import uuid
 import logging
 import pathlib
-import tempfile
 from datetime import datetime
 
 # --- Paths ---
-BASE_DIR      = pathlib.Path(__file__).parent.resolve()
-COOKIES_FILE  = BASE_DIR / "yt.txt"
-# Sad ide ispod /tmp, gde Space dozvoljava pisanje
-HLS_ROOT_BASE = pathlib.Path(tempfile.gettempdir())
-HLS_ROOT      = HLS_ROOT_BASE / "hls_segments"
+BASE_DIR     = pathlib.Path(__file__).parent.resolve()
+COOKIES_FILE = BASE_DIR / "yt.txt"
+HLS_ROOT     = BASE_DIR / "hls_segments"
 
 # --- Ensure dirs exist ---
 os.makedirs(HLS_ROOT, exist_ok=True)
@@ -59,41 +56,37 @@ async def root():
 @app.get("/stream/", summary="HLS stream")
 async def stream_video(request: Request, url: str = Query(...), resolution: int = Query(1080)):
     try:
-        # 1) Extract formats
-        ydl_opts = {
-            'quiet': True,
-            'cookiefile': str(COOKIES_FILE),
-            'no_warnings': True,
-        }
+        # 1) Extraktujemo sve formate
+        ydl_opts = {'quiet': True, 'cookiefile': str(COOKIES_FILE), 'no_warnings': True}
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             info = ydl.extract_info(url, download=False)
 
-        # 2) Select exact video-only 1080p mp4
+        # 2) Biramo tačno 1080p mp4 video-only
         vid_fmt = next(
             f for f in info['formats']
             if f.get('vcodec') != 'none' and f.get('height') == resolution and f.get('ext') == 'mp4'
         )
-        # 3) Select best audio-only
+        # 3) Biramo najbolji audio-only
         aud_fmt = max(
             (f for f in info['formats'] if f.get('vcodec') == 'none' and f.get('acodec') != 'none'),
             key=lambda x: x.get('abr', 0)
         )
 
-        # 4) Prepare HLS session dir under /tmp
+        # 4) Priprema HLS sesije
         session_id = uuid.uuid4().hex
         sess_dir = HLS_ROOT / session_id
         os.makedirs(sess_dir, exist_ok=True)
 
-        # 5) Build ffmpeg command with UA + Cookie headers
+        # 5) Pokrećemo ffmpeg da pravi .m3u8 + .ts fajlove
         cookie_header = load_cookies_header()
-        hdr = ['-headers', f"User-Agent: Mozilla/5.0\r\nCookie: {cookie_header}\r\n"]
+        hdr = ['-headers', f"Cookie: {cookie_header}\r\n"]
         cmd = [
             'ffmpeg', '-hide_banner', '-loglevel', 'error',
             *hdr, '-i', vid_fmt['url'],
             *hdr, '-i', aud_fmt['url'],
             '-c:v', 'copy', '-c:a', 'copy',
             '-f', 'hls',
-            '-hls_time', '4',
+            '-hls_time', '1',               # segment od 1s
             '-hls_list_size', '0',
             '-hls_flags', 'delete_segments+append_list',
             '-hls_segment_filename', str(sess_dir / 'seg_%03d.ts'),
@@ -101,9 +94,9 @@ async def stream_video(request: Request, url: str = Query(...), resolution: int 
         ]
         proc = subprocess.Popen(cmd, cwd=str(sess_dir))
 
-        # 6) Wait for playlist (up to 10s)
+        # 6) Sačekamo da index.m3u8 bude napisan (do ~2.5s)
         playlist_path = sess_dir / 'index.m3u8'
-        for _ in range(20):
+        for _ in range(5):                 # čekamo 5×0.5s = 2.5s
             if playlist_path.exists():
                 break
             await asyncio.sleep(0.5)
@@ -111,7 +104,7 @@ async def stream_video(request: Request, url: str = Query(...), resolution: int 
             proc.kill()
             raise HTTPException(status_code=500, detail="HLS playlist generation failed")
 
-        # 7) Redirect to the generated playlist
+        # 7) Preusmerimo klijenta na playlistu
         playlist_url = request.url_for('hls', path=f"{session_id}/index.m3u8")
         return RedirectResponse(playlist_url)
 
