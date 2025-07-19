@@ -10,14 +10,16 @@ import subprocess
 import uuid
 import logging
 import pathlib
+import tempfile
 from datetime import datetime
 
-# --- Paths (writeable on HF Spaces/VPS) ---
-CACHE_DIR = pathlib.Path(os.getenv("XDG_CACHE_HOME", "/mnt/data"))
-HLS_ROOT  = CACHE_DIR / "hls_segments"
-COOKIES_FILE = pathlib.Path(__file__).parent.resolve() / "yt.txt"
+# --- Paths ---
+BASE_DIR      = pathlib.Path(__file__).parent.resolve()
+COOKIES_FILE  = BASE_DIR / "yt.txt"
+HLS_ROOT_BASE = pathlib.Path(tempfile.gettempdir())
+HLS_ROOT      = HLS_ROOT_BASE / "hls_segments"
 
-# --- Ensure HLS dir exists ---
+# --- Ensure dirs exist ---
 HLS_ROOT.mkdir(parents=True, exist_ok=True)
 
 # --- Concurrency & Logging ---
@@ -26,7 +28,7 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(
 logger = logging.getLogger(__name__)
 
 # --- FastAPI setup ---
-app = FastAPI(title="YouTube Downloader with HLS", version="2.0.4")
+app = FastAPI(title="YouTube Downloader with HLS", version="2.0.5")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 app.mount("/hls", StaticFiles(directory=str(HLS_ROOT)), name="hls")
 
@@ -56,21 +58,16 @@ async def root():
 @app.get("/stream/", summary="HLS stream")
 async def stream_video(request: Request, url: str = Query(...), resolution: int = Query(1080)):
     try:
-        # 1) Izvlačimo info sa dodatnim HTTP zaglavljima
+        # 1) Izvlacenje formata
         ydl_opts = {
             'quiet': True,
             'cookiefile': str(COOKIES_FILE),
             'no_warnings': True,
-            'http_headers': {
-                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)',
-                'Referer': 'https://www.youtube.com',
-                'Accept-Language': 'en-US,en;q=0.9',
-            },
         }
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             info = ydl.extract_info(url, download=False)
 
-        # 2) 1080p mp4 video-only
+        # 2) Video-only tok 1080p mp4
         vid_fmt = next(
             f for f in info['formats']
             if f.get('vcodec') != 'none'
@@ -78,18 +75,18 @@ async def stream_video(request: Request, url: str = Query(...), resolution: int 
                and f.get('ext') == 'mp4'
         )
 
-        # 3) Najbolji audio-only
+        # 3) Najbolji audio-only tok
         aud_fmt = max(
             (f for f in info['formats'] if f.get('vcodec') == 'none' and f.get('acodec') != 'none'),
             key=lambda x: x.get('abr', 0)
         )
 
-        # 4) Priprema HLS sesije
+        # 4) Priprema sesije
         session_id = uuid.uuid4().hex
         sess_dir = HLS_ROOT / session_id
         sess_dir.mkdir(parents=True, exist_ok=True)
 
-        # 5) Pokrenemo ffmpeg da generiše .m3u8 + .ts
+        # 5) FFMPEG za HLS sa segmentima od 2s, zadrži poslednja 4
         cookie_header = load_cookies_header()
         hdr = ['-headers', f"Cookie: {cookie_header}\r\n"]
         cmd = [
@@ -98,17 +95,17 @@ async def stream_video(request: Request, url: str = Query(...), resolution: int 
             *hdr, '-i', aud_fmt['url'],
             '-c:v', 'copy', '-c:a', 'copy',
             '-f', 'hls',
-            '-hls_time', '2',                         # segmenti po 2s
-            '-hls_list_size', '3',                    # zadrži 3 segmenta
-            '-hls_flags', 'delete_segments+append_list+independent_segments',
+            '-hls_time', '2',
+            '-hls_list_size', '4',
+            '-hls_flags', 'delete_segments+append_list',
             '-hls_segment_filename', str(sess_dir / 'seg_%03d.ts'),
             str(sess_dir / 'index.m3u8')
         ]
         proc = subprocess.Popen(cmd, cwd=str(sess_dir))
 
-        # 6) Čekamo da playlist.a.m3u8 bude dostupna (max ~3s)
+        # 6) Kraći timeout: čekaj do ~2s da playlist bude spremna
         playlist_path = sess_dir / 'index.m3u8'
-        for _ in range(15):
+        for _ in range(10):
             if playlist_path.exists():
                 break
             await asyncio.sleep(0.2)
@@ -116,7 +113,7 @@ async def stream_video(request: Request, url: str = Query(...), resolution: int 
             proc.kill()
             raise HTTPException(status_code=500, detail="HLS playlist generation failed")
 
-        # 7) Preusmeravamo na stream
+        # 7) Preusmerenje na .m3u8
         playlist_url = request.url_for('hls', path=f"{session_id}/index.m3u8")
         return RedirectResponse(playlist_url)
 
